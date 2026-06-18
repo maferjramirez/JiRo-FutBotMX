@@ -4,7 +4,7 @@ import math
 
 class SoccerTracker:
     def __init__(self, fps=30.0, cm_per_pixel=1.0, possession_threshold=50.0, 
-                 yellow_goal_roi=None, blue_goal_roi=None, team_mapping=None):
+                 yellow_goal_roi=None, blue_goal_roi=None, team_mapping=None, debug=False):
         """
         Clase para calcular estadísticas de fútbol robot
         
@@ -12,18 +12,27 @@ class SoccerTracker:
             fps (float): Cuadros por segundo (FPS) del vídeo.
             cm_per_pixel (float): Factor de escala físico (cm por píxel).
             possession_threshold (float): Distancia máxima (en píxeles) para considerar posesión de balón.
-            yellow_goal_roi (list): [xmin, ymin, xmax, ymax] de la portería amarilla.
-            blue_goal_roi (list): [xmin, ymin, xmax, ymax] de la portería azul.
+            yellow_goal_roi (list): ROI de la portería amarilla.
+                - Polígono de 4 puntos: [x1, y1, x2, y2, x3, y3, x4, y4]
+            blue_goal_roi (list): ROI de la portería azul.
+                - Polígono de 4 puntos: [x1, y1, x2, y2, x3, y3, x4, y4]
             team_mapping (dict): Mapeo de obj_id a nombre del equipo (e.g. {1: 'Team Yellow', 2: 'Team Blue'}).
         """
         self.fps = fps
         self.cm_per_pixel = cm_per_pixel
         self.possession_threshold = possession_threshold
         
-        self.yellow_goal_roi = yellow_goal_roi if yellow_goal_roi is not None else [0, 0, 0, 0]
-        self.blue_goal_roi = blue_goal_roi if blue_goal_roi is not None else [0, 0, 0, 0]
+        # Orden de puntos para ROI poligonal: arriba-izquierda, arriba-derecha,
+        # abajo-derecha, abajo-izquierda (sentido horario).
+        self.yellow_goal_roi = self._normalize_goal_roi(
+            yellow_goal_roi if yellow_goal_roi is not None else [0, 0, 0, 0]
+        )
+        self.blue_goal_roi = self._normalize_goal_roi(
+            blue_goal_roi if blue_goal_roi is not None else [0, 0, 0, 0]
+        )
         
         self.team_mapping = team_mapping if team_mapping is not None else {}
+        self.debug = debug
         
         self.ball_trajectory = [] # Lista de (frame_idx, bx, by)
         self.robot_trajectories = {} # obj_id -> Lista de (frame_idx, rx, ry)
@@ -39,11 +48,294 @@ class SoccerTracker:
         
         self.scores = {"Team Yellow": 0, "Team Blue": 0}
 
+        # 4 robots
+        self.tracker_id_map = {}
+        self.last_frame_raw_to_pid = {}
+        self.last_selected_ball_box = None
+        self.current_frame_idx = 0
+        
+        # IDs de cada equipo 
+        self.yellow_pids = []
+        self.blue_pids = []
+        for pid, team_name in self.team_mapping.items():
+            if "yellow" in team_name.lower():
+                self.yellow_pids.append(pid)
+            elif "blue" in team_name.lower():
+                self.blue_pids.append(pid)
+
+        # 2 IDs por equipo
+        all_defined_pids = set(self.yellow_pids + self.blue_pids)
+        next_candidate = 1
+        
+        while len(self.yellow_pids) < 2:
+            if next_candidate not in all_defined_pids:
+                self.yellow_pids.append(next_candidate)
+                all_defined_pids.add(next_candidate)
+                self.team_mapping[next_candidate] = f"Robot Yellow {next_candidate}"
+            next_candidate += 1
+            
+        while len(self.blue_pids) < 2:
+            if next_candidate not in all_defined_pids:
+                self.blue_pids.append(next_candidate)
+                all_defined_pids.add(next_candidate)
+                self.team_mapping[next_candidate] = f"Robot Blue {next_candidate}"
+            next_candidate += 1
+
     def _get_center_from_box(self, box):
         if box is None or len(box) < 4:
             return None
         x, y, w, h = box
         return (x + w / 2.0, y + h / 2.0)
+
+    def _point_inside_box(self, px, py, box, margin=0.0):
+        if box is None or len(box) < 4:
+            return False
+        x, y, w, h = box
+        return (x - margin) <= px <= (x + w + margin) and (y - margin) <= py <= (y + h + margin)
+
+    def _normalize_goal_roi(self, roi):
+        if roi is None:
+            return [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
+
+        if isinstance(roi, np.ndarray):
+            roi = roi.tolist()
+
+        # Caso 1: Lista de 4 puntos [(x1, y1), (x2, y2), (x3, y3), (x4, y4)]
+        if len(roi) == 4 and isinstance(roi[0], (list, tuple, np.ndarray)):
+            return [(float(pt[0]), float(pt[1])) for pt in roi]
+
+        # Caso 2: 4 números planos [xmin, ymin, xmax, ymax]
+        if len(roi) == 4:
+            xmin, ymin, xmax, ymax = [float(v) for v in roi]
+            return [
+                (xmin, ymin),
+                (xmax, ymin),
+                (xmax, ymax),
+                (xmin, ymax),
+            ]
+
+        # Caso 3: 8 números planos [x1, y1, x2, y2, x3, y3, x4, y4]
+        if len(roi) == 8:
+            return [
+                (float(roi[0]), float(roi[1])),
+                (float(roi[2]), float(roi[3])),
+                (float(roi[4]), float(roi[5])),
+                (float(roi[6]), float(roi[7])),
+            ]
+
+        raise ValueError("goal_roi debe tener 4 puntos (x,y) o una lista de 4 u 8 valores planos")
+
+    def _goal_center_y(self, goal_roi):
+        return float(np.mean([p[1] for p in goal_roi]))
+
+    def _point_inside_goal_roi(self, px, py, goal_roi):
+        contour = np.array(goal_roi, dtype=np.float32)
+        return cv2.pointPolygonTest(contour, (float(px), float(py)), False) >= 0
+
+    def _calculate_iou(self, box1, box2):
+        """Calcula el Intersection over Union (IoU) y el Intersection over Area (IoA)."""
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+        
+        # Coordenadas de las esquinas
+        x1_min, y1_min, x1_max, y1_max = x1, y1, x1 + w1, y1 + h1
+        x2_min, y2_min, x2_max, y2_max = x2, y2, x2 + w2, y2 + h2
+        
+        # Intersección
+        inter_x_min = max(x1_min, x2_min)
+        inter_y_min = max(y1_min, y2_min)
+        inter_x_max = min(x1_max, x2_max)
+        inter_y_max = min(y1_max, y2_max)
+        
+        if inter_x_max <= inter_x_min or inter_y_max <= inter_y_min:
+            return 0.0
+            
+        inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+        box1_area = w1 * h1
+        box2_area = w2 * h2
+        union_area = box1_area + box2_area - inter_area
+        
+        if union_area <= 0:
+            return 0.0
+            
+        iou = inter_area / union_area
+        ioa = inter_area / min(box1_area, box2_area)
+        return max(iou, ioa)
+
+    def _filter_duplicate_robot_boxes(self, robot_boxes_dict, masks_dict=None, overlap_threshold=0.6):
+        """
+        Filtra cajas duplicadas/superpuestas que representan el mismo robot
+        """
+        if not robot_boxes_dict:
+            return {}, {} if masks_dict is not None else None
+
+        filtered_boxes = {}
+        filtered_masks = {} if masks_dict is not None else None
+        
+        for key in sorted(robot_boxes_dict.keys()):
+            box = robot_boxes_dict[key]
+            
+            #si se superpone demasiado con alguna caja
+            is_duplicate = False
+            for accepted_box in filtered_boxes.values():
+                if self._calculate_iou(box, accepted_box) > overlap_threshold:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                filtered_boxes[key] = box
+                if masks_dict is not None and key in masks_dict:
+                    filtered_masks[key] = masks_dict[key]
+                    
+        return filtered_boxes, filtered_masks
+
+    def _is_ball_candidate_valid(self, ball_box, robot_boxes_dict, robot_margin_ratio=0.12, max_area_ratio=0.35):
+        if ball_box is None or len(ball_box) < 4:
+            return False
+
+        x, y, w, h = [float(v) for v in ball_box[:4]]
+        if w <= 0 or h <= 0:
+            return False
+
+        ball_center = (x + w / 2.0, y + h / 2.0)
+        ball_area = w * h
+
+        robot_areas = []
+        for robot_box in robot_boxes_dict.values():
+            if robot_box is None or len(robot_box) < 4:
+                continue
+
+            rx, ry, rw, rh = [float(v) for v in robot_box[:4]]
+            robot_areas.append(rw * rh)
+
+            margin_x = rw * robot_margin_ratio
+            margin_y = rh * robot_margin_ratio
+            expanded_box = [rx - margin_x, ry - margin_y, rw + 2.0 * margin_x, rh + 2.0 * margin_y]
+            if self._point_inside_box(ball_center[0], ball_center[1], expanded_box):
+                return False
+
+        if robot_areas:
+            reference_robot_area = min(robot_areas)
+            if ball_area > reference_robot_area * max_area_ratio:
+                return False
+
+        return True
+
+    def _select_ball_candidate(self, ball_candidates, robot_boxes_dict):
+        if ball_candidates is None:
+            return None
+
+        if isinstance(ball_candidates, (list, tuple, np.ndarray)) and len(ball_candidates) > 0 and isinstance(ball_candidates[0], (list, tuple, np.ndarray)):
+            candidates = [box for box in ball_candidates if self._is_ball_candidate_valid(box, robot_boxes_dict)]
+            if not candidates:
+                return None
+
+            if len(self.ball_trajectory) == 0:
+                return candidates[0]
+
+            _, last_bx, last_by = self.ball_trajectory[-1]
+            best_box = candidates[0]
+            min_dist = float('inf')
+            for box in candidates:
+                center = self._get_center_from_box(box)
+                if center is None:
+                    continue
+                bx, by = center
+                dist = math.sqrt((bx - last_bx)**2 + (by - last_by)**2)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_box = box
+            return best_box
+
+        return ball_candidates if self._is_ball_candidate_valid(ball_candidates, robot_boxes_dict) else None
+    
+    def _map_robot_detections(self, robot_boxes_dict, masks_dict=None, update_state=True):
+        """
+        Mapea IDs cambiantes/arbitrarios del tracker a un conjunto persistente:
+        - IDs para el equipo Yellow (self.yellow_pids)
+        - IDs para el equipo Blue (self.blue_pids)
+        """
+        robot_boxes_dict, masks_dict = self._filter_duplicate_robot_boxes(robot_boxes_dict, masks_dict)
+
+        mapped_boxes = {}
+        mapped_masks = {} if masks_dict is not None else None
+
+        if update_state:
+            already_mapped_pids = set()
+            unmapped_raw_ids = []
+            
+            active_pid_to_raw = {}
+            for raw_id in robot_boxes_dict:
+                if raw_id in self.tracker_id_map:
+                    pid = self.tracker_id_map[raw_id]
+                    if pid not in active_pid_to_raw:
+                        active_pid_to_raw[pid] = raw_id
+                        mapped_boxes[pid] = robot_boxes_dict[raw_id]
+                        if masks_dict is not None and raw_id in masks_dict:
+                            mapped_masks[pid] = masks_dict[raw_id]
+                        already_mapped_pids.add(pid)
+                    else:
+                        # Conflicto detectado, forzar reasignación
+                        unmapped_raw_ids.append(raw_id)
+                else:
+                    unmapped_raw_ids.append(raw_id)
+
+            # Calcular el centro de las porterías
+            yellow_center_y = self._goal_center_y(self.yellow_goal_roi)
+            blue_center_y = self._goal_center_y(self.blue_goal_roi)
+
+            # primer ID desocupado de su respectivo equipo
+            for raw_id in unmapped_raw_ids:
+                box = robot_boxes_dict[raw_id]
+                center = self._get_center_from_box(box)
+                if center is None:
+                    continue
+                rx, ry = center
+                
+                dist_to_yellow = abs(ry - yellow_center_y)
+                dist_to_blue = abs(ry - blue_center_y)
+                
+                if dist_to_yellow < dist_to_blue:
+                    # Equipo Yellow
+                    pid = None
+                    for y_pid in self.yellow_pids:
+                        if y_pid not in already_mapped_pids:
+                            pid = y_pid
+                            break
+                    if pid is None:
+                        continue # Ambos IDs de Yellow ocupados en este frame
+                else:
+                    # Equipo Blue
+                    pid = None
+                    for b_pid in self.blue_pids:
+                        if b_pid not in already_mapped_pids:
+                            pid = b_pid
+                            break
+                    if pid is None:
+                        continue # Ambos IDs de Blue ocupados en este frame
+
+                self.tracker_id_map[raw_id] = pid
+                mapped_boxes[pid] = box
+                if masks_dict is not None and raw_id in masks_dict:
+                    mapped_masks[pid] = masks_dict[raw_id]
+                already_mapped_pids.add(pid)
+                
+            self.last_frame_raw_to_pid = {raw_id: pid for raw_id, pid in self.tracker_id_map.items() if raw_id in robot_boxes_dict}
+        else:
+            last_mapping = getattr(self, 'last_frame_raw_to_pid', {})
+            active_pid_to_raw = {}
+            for raw_id, box in robot_boxes_dict.items():
+                pid = last_mapping.get(raw_id)
+                if pid is None:
+                    pid = self.tracker_id_map.get(raw_id)
+                
+                if pid is not None and pid not in active_pid_to_raw:
+                    active_pid_to_raw[pid] = raw_id
+                    mapped_boxes[pid] = box
+                    if masks_dict is not None and raw_id in masks_dict:
+                        mapped_masks[pid] = masks_dict[raw_id]
+
+        return mapped_boxes, mapped_masks
 
     def update(self, frame_idx, ball_box, robot_boxes_dict):
         """
@@ -54,6 +346,18 @@ class SoccerTracker:
             ball_box (list): Caja delimitadora [x, y, w, h] del balón o None.
             robot_boxes_dict (dict): Diccionario obj_id -> [x, y, w, h] de los robots.
         """
+        self.current_frame_idx = frame_idx
+
+        # máximo 4
+        robot_boxes_dict, _ = self._map_robot_detections(robot_boxes_dict, update_state=True)
+
+        if isinstance(ball_box, list) and len(ball_box) == 0:
+            ball_box = None
+
+        ball_box = self._select_ball_candidate(ball_box, robot_boxes_dict)
+
+        self.last_selected_ball_box = ball_box
+
         ball_center = self._get_center_from_box(ball_box)
         if ball_center is not None:
             bx, by = ball_center
@@ -62,15 +366,12 @@ class SoccerTracker:
             if self.in_goal_state is not None:
                 self.goal_cooldown_counter -= 1
                 if self.goal_cooldown_counter <= 0:
-                    in_yellow = (self.yellow_goal_roi[0] <= bx <= self.yellow_goal_roi[2] and 
-                                 self.yellow_goal_roi[1] <= by <= self.yellow_goal_roi[3])
-                    in_blue = (self.blue_goal_roi[0] <= bx <= self.blue_goal_roi[2] and 
-                               self.blue_goal_roi[1] <= by <= self.blue_goal_roi[3])
+                    in_yellow = self._point_inside_goal_roi(bx, by, self.yellow_goal_roi)
+                    in_blue = self._point_inside_goal_roi(bx, by, self.blue_goal_roi)
                     if not in_yellow and not in_blue:
                         self.in_goal_state = None
             else:
-                if (self.yellow_goal_roi[0] <= bx <= self.yellow_goal_roi[2] and 
-                    self.yellow_goal_roi[1] <= by <= self.yellow_goal_roi[3]):
+                if self._point_inside_goal_roi(bx, by, self.yellow_goal_roi):
                     self.in_goal_state = 'yellow'
                     self.goal_cooldown_counter = self.cooldown_frames
                     goal_time = frame_idx / self.fps
@@ -81,8 +382,7 @@ class SoccerTracker:
                     })
                     self.scores["Team Blue"] += 1
                 
-                elif (self.blue_goal_roi[0] <= bx <= self.blue_goal_roi[2] and 
-                      self.blue_goal_roi[1] <= by <= self.blue_goal_roi[3]):
+                elif self._point_inside_goal_roi(bx, by, self.blue_goal_roi):
                     self.in_goal_state = 'blue'
                     self.goal_cooldown_counter = self.cooldown_frames
                     goal_time = frame_idx / self.fps
@@ -235,8 +535,54 @@ class SoccerTracker:
         Returns:
             np.ndarray: Frame anotado.
         """
+
+        # máximo 4
+        robot_boxes_dict, masks_dict = self._map_robot_detections(robot_boxes_dict, masks_dict, update_state=False)
+
+        ball_box = self._select_ball_candidate(ball_box, robot_boxes_dict)
+
         annotated = frame.copy()
         h, w, _ = annotated.shape
+        
+        # Dibujar ROIs de porterías si debug
+        if getattr(self, 'debug', False):
+            overlay = annotated.copy()
+            if self.yellow_goal_roi and len(self.yellow_goal_roi) == 4:
+                yellow_pts = np.array(self.yellow_goal_roi, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.fillPoly(overlay, [yellow_pts], (0, 255, 255))
+                cv2.polylines(annotated, [yellow_pts], isClosed=True, color=(0, 255, 255), thickness=2)
+                x1 = int(np.min(yellow_pts[:, :, 0]))
+                y1 = int(np.min(yellow_pts[:, :, 1]))
+                cv2.putText(annotated, "Goal Yellow ROI", (x1, max(0, y1 - 5)), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+            if self.blue_goal_roi and len(self.blue_goal_roi) == 4:
+                blue_pts = np.array(self.blue_goal_roi, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.fillPoly(overlay, [blue_pts], (255, 120, 0))
+                cv2.polylines(annotated, [blue_pts], isClosed=True, color=(255, 120, 0), thickness=2)
+                x1 = int(np.min(blue_pts[:, :, 0]))
+                y1 = int(np.min(blue_pts[:, :, 1]))
+                cv2.putText(annotated, "Goal Blue ROI", (x1, max(0, y1 - 5)), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 120, 0), 1, cv2.LINE_AA)
+            annotated = cv2.addWeighted(overlay, 0.15, annotated, 0.85, 0)
+        
+        # Dibujar estela de 3 segundos
+        max_trail_frames = int(3.0 * self.fps)
+        current_frame = getattr(self, 'current_frame_idx', 0)
+        min_frame_idx = current_frame - max_trail_frames
+
+        ball_pts = [ (bx, by, f_idx) for f_idx, bx, by in self.ball_trajectory if f_idx >= min_frame_idx ]
+        if len(ball_pts) > 1:
+            for i in range(len(ball_pts) - 1):
+                p1 = (int(round(ball_pts[i][0])), int(round(ball_pts[i][1])))
+                p2 = (int(round(ball_pts[i+1][0])), int(round(ball_pts[i+1][1])))
+                age = current_frame - ball_pts[i][2]
+                alpha = max(0.1, min(1.0, 1.0 - (age / max_trail_frames)))
+                
+                color = (0, 0, int(round(255 * alpha)))
+                thickness = max(1, int(round(3 * alpha)))
+                cv2.line(annotated, p1, p2, color, thickness, cv2.LINE_AA)
+
+
         
         if masks_dict is not None:
             for obj_id, mask in masks_dict.items():
